@@ -3,6 +3,7 @@ from aiogram.filters import CommandStart
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from config import redis
 from utils.redis_helper import redis_safe
+from utils.room_permissions import get_user_role
 
 router = Router()
 
@@ -25,8 +26,29 @@ async def start_ref(message: types.Message, command: CommandStart):
         exists = await redis_safe(redis.get(f"room:{room_id}:name"))
         if exists:
             name = exists.decode() if isinstance(exists, (bytes, bytearray)) else str(exists)
-            await redis_safe(redis.sadd(f"room:{room_id}:members", user_id))
-            await redis_safe(redis.sadd(f"user:{user_id}:rooms", room_id))
+            
+            # Проверяем, не заблокирован ли пользователь (явная проверка banned)
+            is_banned = await redis_safe(redis.sismember(f"room:{room_id}:banned", str(user_id)))
+            if is_banned:
+                await message.answer(
+                    "❌ Вы заблокированы в этой комнате и не можете к ней присоединиться.",
+                    reply_markup=markup,
+                )
+                return
+            
+            # Проверяем, является ли пользователь уже участником
+            is_member = await redis_safe(redis.sismember(f"room:{room_id}:members", str(user_id)))
+            is_admin = await redis_safe(redis.sismember(f"room:{room_id}:admins", str(user_id)))
+            owner_raw = await redis_safe(redis.get(f"room:{room_id}:owner"))
+            is_owner = False
+            if owner_raw:
+                owner_id = int(owner_raw.decode() if isinstance(owner_raw, bytes) else owner_raw)
+                is_owner = (owner_id == user_id)
+            
+            # Добавляем в комнату (если еще не участник, админ или владелец)
+            if not (is_owner or is_admin or is_member):
+                await redis_safe(redis.sadd(f"room:{room_id}:members", str(user_id)))
+                await redis_safe(redis.sadd(f"user:{user_id}:rooms", room_id))
 
             await message.answer(
                 f"🎧 Ты присоединился к комнате <b>{name}</b>!",

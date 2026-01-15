@@ -1,4 +1,7 @@
-import hashlib
+"""
+Handlers для работы с треками
+Рефакторинг с использованием Repository и Service слоев
+"""
 import json
 import secrets
 from types import SimpleNamespace
@@ -7,26 +10,49 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from handlers.rooms import open_room
-from utils.storage import RoomContext
 from utils.youtube import download_track
-from config import redis
+from config import redis, bot as bot_instance
 from utils.redis_helper import redis_safe
+from services.track_service import TrackService
+from services.moderation_service import ModerationService
+from services.room_service import RoomService
+from services.notification_service import NotificationService
+from utils.timezone import iso_now, format_datetime
 
 router = Router()
+
+# Инициализация сервисов и репозиториев
+from repositories.track_repository import TrackRepository
+track_service = TrackService()
+moderation_service = ModerationService()
+room_service = RoomService()
+notification_service = NotificationService()
+track_repo = TrackRepository()
 
 
 class TrackAdd(StatesGroup):
     waiting_for_query = State()
 
 
-# --- Нажатие “Добавить трек” ---
+# --- Нажатие "Добавить трек" ---
 @router.callback_query(F.data.startswith("addtrack:"))
 async def add_track_to_room(callback: types.CallbackQuery, state: FSMContext):
     room_id = callback.data.split(":")[1] # type: ignore
+    user_id = callback.from_user.id  # type: ignore
+    
+    # Проверяем права
+    if not await room_service.can_add_tracks(user_id, room_id):
+        await callback.answer("❌ У вас нет доступа к этой комнате.", show_alert=True)
+        return
+    
+    # Получаем название комнаты
+    room_name = await room_service.get_room_name(room_id)
+    
     await state.update_data(room_id=room_id)
     await state.set_state(TrackAdd.waiting_for_query)
     await callback.message.edit_text( # type: ignore
-        f"🎵 Введи название трека, который хочешь добавить в комнату <b>{room_id}</b>:"
+        f"🎵 Введи название трека, который хочешь добавить в комнату <b>{room_name}</b>:",
+        parse_mode="HTML"
     )
 
 
@@ -37,56 +63,73 @@ async def handle_track_query(message: types.Message, state: FSMContext):
     data = await state.get_data()
     room_id = data.get("room_id")
 
-    await message.answer(f"🔍 Ищу трек <b>{query}</b>...")
+    # Отправляем сообщение о начале загрузки
+    loading_msg = await message.answer(f"🔍 Ищу трек <b>{query}</b>...\n⏳ Это может занять некоторое время...", parse_mode="HTML")
 
-    result = await download_track(query)
-    if not result:
-        await message.answer("⚠️ Не удалось найти или загрузить трек.")
+    try:
+        result = await download_track(query)
+        if not result:
+            await loading_msg.edit_text("⚠️ Не удалось найти или загрузить трек.")
+            await state.clear()
+            return
+
+        # Получаем данные трека
+        title = result["title"]
+        audio_buf = result["buffer"]
+        file_hash = result["hash"]
+        print(f"🎯 title={title}, hash={file_hash}")
+
+        # Создаём временный ключ в redis
+        token = secrets.token_hex(4)
+        cache_key = f"pending_track:{token}"
+        # Получаем имя пользователя: full_name или username
+        user = message.from_user  # type: ignore
+        added_by_name = user.full_name or (f"@{user.username}" if user.username else f"User {user.id}")
+        
+        track_data = {
+            "room_id": room_id,
+            "title": title,
+            "file": file_hash,
+            "user_id": user.id,
+            "added_by": added_by_name
+        }
+        await redis_safe(redis.set(cache_key, json.dumps(track_data), ex=600))
+
+        # Создаём кнопки подтверждения / отмены
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Добавить", callback_data=f"confirm:{token}:public")
+        kb.button(text="🤫 Анонимно", callback_data=f"confirm:{token}:anon")
+        kb.button(text="❌ Отмена", callback_data="cancel_add")
+        kb.adjust(2)
+
+        # Используем mp3 из памяти (важно: читаем buffer и создаем новый BytesIO)
+        audio_buf.seek(0)  # Возвращаемся в начало буфера
+        audio_data = audio_buf.read()
+        input_file = types.BufferedInputFile(audio_data, filename=f"{title}.mp3")
+
+        # Удаляем сообщение о загрузке и отправляем трек
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
+
+        await message.answer_audio(
+            audio=input_file,
+            caption=f"🎧 Это твой трек?",
+            title=title,
+            reply_markup=kb.as_markup()
+        )
+
         await state.clear()
-        return
-
-    # 👇 вот здесь изменено
-    title = result["title"]
-    audio_buf = result["buffer"]
-    file_hash = result["hash"]
-    print(f"🎯 title={title}, hash={file_hash}")
-
-    # создаём временный ключ в redis
-    import secrets, json
-    from utils.redis_helper import redis_safe
-
-    token = secrets.token_hex(4)
-    cache_key = f"pending_track:{token}"
-    track_data = {
-        "room_id": room_id,
-        "title": title,
-        "file": file_hash,
-        "user_id": message.from_user.id,  # type: ignore
-        "added_by": message.from_user.full_name  # type: ignore
-    }
-    await redis_safe(redis.set(cache_key, json.dumps(track_data), ex=600))
-
-    # 👇 создаём кнопки подтверждения / отмены
-    from aiogram.utils.keyboard import InlineKeyboardBuilder
-    kb = InlineKeyboardBuilder()
-    kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Добавить", callback_data=f"confirm:{token}:public")
-    kb.button(text="🤫 Анонимно", callback_data=f"confirm:{token}:anon")
-    kb.button(text="❌ Отмена", callback_data="cancel_add")
-    kb.adjust(2)
-    kb.adjust(2)
-
-    # 👇 используем mp3 из памяти
-    input_file = types.BufferedInputFile(audio_buf.read(), filename=f"{title}.mp3")
-
-    await message.answer_audio(
-        audio=input_file,
-        caption=f"🎧 Это твой трек?",
-        title=title,
-        reply_markup=kb.as_markup()
-    )
-
-    await state.clear()
+    except Exception as e:
+        print(f"❌ Ошибка при загрузке трека: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            await loading_msg.edit_text("⚠️ Произошла ошибка при загрузке трека. Попробуйте еще раз.")
+        except Exception:
+            await message.answer("⚠️ Произошла ошибка при загрузке трека. Попробуйте еще раз.")
+        await state.clear()
 
 
 @router.callback_query(F.data.startswith("confirm:"))
@@ -98,83 +141,125 @@ async def confirm_track(callback: types.CallbackQuery):
 
     data_raw = await redis_safe(redis.get(cache_key))
     if not data_raw:
+        print(f"❌ Трек не найден в кэше: {cache_key}")
         await callback.answer("⚠️ Истёк срок подтверждения трека.", show_alert=True)
         return
 
-    data = json.loads(data_raw)
+    print(f"✅ Данные трека найдены в кэше: {cache_key}")
+    try:
+        data = json.loads(data_raw)
+    except Exception as e:
+        print(f"❌ Ошибка парсинга JSON: {e}, data_raw: {data_raw}")
+        await callback.answer("⚠️ Ошибка обработки данных трека.", show_alert=True)
+        return
     room_id = data["room_id"]
     title = data["title"]
     file_hash = data["file"]
     user_id = data["user_id"]
     added_by = "анонимно" if anon else data["added_by"]
 
-    print(f"🧩 confirm_track: room_id={room_id}, title={title}, file_hash={file_hash}")
+    print(f"🧩 confirm_track: room_id={room_id}, title={title}, file_hash={file_hash}, user_id={user_id}, anon={anon}")
 
-    # --- защита от повторов ---
-    existing_tracks_raw = await redis_safe(redis.lrange(f"room:{room_id}:tracks", 0, -1))
-    for t_raw in existing_tracks_raw or []:
-        t = json.loads(t_raw)
-        if t.get("file") == file_hash or t.get("title").lower() == title.lower():
-            await callback.answer("🚫 Этот трек уже есть в плейлисте.", show_alert=True)
-            return
-
-    # --- сохраняем трек ---
-    track_obj = {
-        "title": title,
-        "file": file_hash,
-        "added_by": added_by,
-        "user_id": user_id
-    }
-
-    await redis_safe(redis.rpush(f"room:{room_id}:tracks", json.dumps(track_obj)))
-
-    # --- уведомляем владельца + участников ---
-    members_raw = await redis_safe(redis.smembers(f"room:{room_id}:members"))
-    members = [int(m.decode() if isinstance(m, bytes) else m) for m in (members_raw or [])]
-
-    owner = await redis_safe(redis.get(f"room:{room_id}:owner"))
-    if owner:
-        owner_id = int(owner)
-        if owner_id not in members:
-            members.append(owner_id)
-
-    message_text = (
-        f"🎵 В комнату <b>{room_id}</b> добавлен новый трек:\n"
-        f"<b>{title}</b> от {added_by}"
-    )
-
-    for member_id in members:
-        # не спамим отправителю
-        if member_id == user_id:
-            continue
+    # --- проверяем, является ли пользователь админом/владельцем ---
+    is_admin = await room_service.is_admin_or_owner(user_id, room_id)
+    print(f"🔐 Пользователь {user_id} является админом/владельцем: {is_admin}")
+    
+    # --- проверяем модерацию (админы и владельцы пропускают модерацию) ---
+    moderation_enabled = await room_service.is_moderation_enabled(room_id)
+    print(f"🔐 Модерация включена: {moderation_enabled}")
+    
+    if moderation_enabled and not is_admin:
+        # Отправляем на модерацию через сервис
         try:
-            await callback.bot.send_message(member_id, message_text)  # type: ignore
+            moderation_token = await moderation_service.submit_for_moderation(
+                room_id=room_id,
+                title=title,
+                file_hash=file_hash,
+                added_by=added_by,
+                user_id=user_id,
+                anon=anon
+            )
+            
+            # Уведомляем админов
+            await notification_service.notify_admins_new_moderation(
+                room_id=room_id,
+                track_title=title,
+                added_by=added_by,
+                exclude_user_id=user_id
+            )
+            
+            await callback.answer("⏳ Трек отправлен на модерацию. Администраторы получат уведомление.")
+            try:
+                await callback.message.delete() # type: ignore
+            except Exception:
+                pass
+            
+            # Открываем комнату после отправки на модерацию
+            total_tracks = len(await track_repo.get_all_tracks(room_id))
+            per_page = 10
+            last_page = max(0, (total_tracks - 1) // per_page)
+            
+            fake_callback = SimpleNamespace(
+                data=f"roompage:{room_id}:{last_page}",
+                from_user=callback.from_user,
+                message=callback.message,
+                bot=callback.bot
+            )
+            
+            await open_room(fake_callback)
+            return
+        except Exception as e:
+            print(f"❌ Ошибка при отправке на модерацию: {e}")
+            await callback.answer("⚠️ Ошибка при отправке трека на модерацию.", show_alert=True)
+            return
+    
+    # --- сохраняем трек напрямую (без модерации, админ добавляет) ---
+    try:
+        result = await track_service.add_track_to_room(
+            room_id=room_id,
+            title=title,
+            file_hash=file_hash,
+            added_by=added_by,
+            user_id=user_id,
+            anon=anon
+        )
+        
+        print(f"✅ Трек {title} добавлен в комнату {room_id}")
+        
+        # Уведомляем участников
+        await notification_service.notify_new_track(
+            room_id=room_id,
+            track_title=title,
+            added_by=added_by,
+            exclude_user_id=user_id
+        )
+        
+        await callback.answer("✅ Трек добавлен!")
+        try:
+            await callback.message.delete()  # type: ignore
         except Exception:
             pass
-
-    # --- подтверждение пользователю ---
-    await callback.answer("✅ Трек добавлен!")
-    try:
-        await callback.message.delete()  # type: ignore
-    except Exception:
-        pass
-
-    # --- открываем последнюю страницу ---
-    total_tracks = await redis_safe(redis.llen(f"room:{room_id}:tracks")) or 0
-    per_page = 10
-    last_page = max(0, (total_tracks - 1) // per_page)
-
-    print(f"📄 открываем последнюю страницу: {last_page} для room_id={room_id}")
-
-    # создаём поддельный callback с нужными атрибутами
-    fake_callback = SimpleNamespace(
-        data=f"roompage:{room_id}:{last_page}",
-        from_user=callback.from_user,
-        message=callback.message,
-        bot=callback.bot
-    )
-
-    await open_room(fake_callback)
+        
+        # Открываем комнату с обновленным списком треков
+        total_tracks = len(await track_repo.get_all_tracks(room_id))
+        per_page = 10
+        last_page = max(0, (total_tracks - 1) // per_page)
+        
+        fake_callback = SimpleNamespace(
+            data=f"roompage:{room_id}:{last_page}",
+            from_user=callback.from_user,
+            message=callback.message,
+            bot=callback.bot
+        )
+        
+        await open_room(fake_callback)
+    except ValueError as e:
+        await callback.answer(str(e), show_alert=True)
+    except Exception as e:
+        print(f"❌ ОШИБКА при сохранении трека: {e}")
+        import traceback
+        traceback.print_exc()
+        await callback.answer("⚠️ Ошибка при сохранении трека.", show_alert=True)
 
 
 # --- Отмена ---
@@ -198,3 +283,211 @@ async def cancel_add(callback: types.CallbackQuery):
         )
 
         await open_room(fake_callback)
+
+
+# --- Одобрение трека администратором (из уведомления) ---
+@router.callback_query(F.data.startswith("approve_track:"))
+async def approve_track(callback: types.CallbackQuery):
+    """Одобряет трек из уведомления администратору"""
+    parts = callback.data.split(":") # type: ignore
+    room_id = parts[1]
+    token = parts[2]
+    admin_id = callback.from_user.id  # type: ignore
+    
+    # Проверяем права
+    if not await room_service.is_admin_or_owner(admin_id, room_id):
+        await callback.answer("❌ Только администраторы могут одобрять треки.", show_alert=True)
+        return
+    
+    # Одобряем трек через сервис
+    try:
+        result = await moderation_service.approve_track(room_id, token, admin_id)
+        title = result["track"]["title"]
+        user_id = result["user_id"]
+        added_by = result["track"].get("added_by", "Неизвестно")
+        
+        # Уведомляем пользователя через сервис
+        await notification_service.notify_track_approved(user_id, room_id, title)
+        
+        # Уведомляем участников через сервис
+        await notification_service.notify_new_track(
+            room_id=room_id,
+            track_title=title,
+            added_by=added_by,
+            exclude_user_id=user_id
+        )
+        
+        await callback.answer("✅ Трек одобрен и добавлен!")
+        
+        # Удаляем сообщение с уведомлением о модерации
+        try:
+            await callback.message.delete() # type: ignore
+        except Exception:
+            pass
+    except ValueError as e:
+        await callback.answer(str(e), show_alert=True)
+    except Exception as e:
+        print(f"❌ Ошибка при одобрении трека: {e}")
+        await callback.answer("⚠️ Ошибка при одобрении трека.", show_alert=True)
+
+
+# --- Отклонение трека администратором ---
+@router.callback_query(F.data.startswith("reject_track:"))
+async def reject_track(callback: types.CallbackQuery):
+    parts = callback.data.split(":") # type: ignore
+    room_id = parts[1]
+    token = parts[2]
+    
+    # Проверяем права
+    admin_id = callback.from_user.id  # type: ignore
+    if not await room_service.is_admin_or_owner(admin_id, room_id):
+        await callback.answer("❌ Только администраторы могут отклонять треки.", show_alert=True)
+        return
+    
+    # Отклоняем трек через сервис
+    try:
+        result = await moderation_service.reject_track(room_id, token, admin_id)
+        title = result["track"]["title"]
+        user_id = result["user_id"]
+        
+        # Уведомляем пользователя через сервис
+        await notification_service.notify_track_rejected(user_id, room_id, title)
+        
+        await callback.answer("❌ Трек отклонен")
+        try:
+            await callback.message.delete() # type: ignore
+        except Exception:
+            pass
+    except ValueError as e:
+        await callback.answer(str(e), show_alert=True)
+    except Exception as e:
+        print(f"❌ Ошибка при отклонении трека: {e}")
+        await callback.answer("⚠️ Ошибка при отклонении трека.", show_alert=True)
+
+
+# --- Мои треки ---
+@router.callback_query(F.data.startswith("my_tracks:"))
+async def show_my_tracks(callback: types.CallbackQuery):
+    parts = callback.data.split(":") # type: ignore
+    room_id = parts[1]
+    page = int(parts[2]) if len(parts) > 2 else 0
+    user_id = callback.from_user.id # type: ignore
+    
+    # Получаем все треки пользователя через репозиторий
+    tracks_data = await track_repo.get_user_tracks(user_id, room_id)
+    
+    if not tracks_data:
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Назад к комнате", callback_data=f"room:{room_id}")
+        await callback.message.edit_text( # type: ignore
+            "🎵 <b>Мои треки</b>\n\n"
+            "У вас пока нет треков в этой комнате.",
+            reply_markup=kb.as_markup(),
+            parse_mode="HTML"
+        )
+        return
+    
+    # Сортируем по статусу: pending, approved, rejected
+    status_order = {"pending": 0, "approved": 1, "rejected": 2}
+    tracks_data.sort(key=lambda x: (status_order.get(x.get("status", "approved"), 1), x.get("title", "")))
+    
+    # Подсчитываем статистику
+    total_tracks = len(tracks_data)
+    approved_count = len([t for t in tracks_data if t.get("status") == "approved"])
+    
+    # Пагинация
+    per_page = 10
+    total_pages = max(1, (total_tracks + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = start + per_page
+    page_tracks = tracks_data[start:end]
+    
+    # Формируем текст
+    text = f"🎵 <b>Мои треки</b>\n"
+    
+    # Показываем информацию о странице и статистику
+    if total_pages > 1:
+        text += f"📄 Страница {page + 1} из {total_pages}\n"
+    text += f"✅ Добавлено: <b>{approved_count}</b> из <b>{total_tracks}</b> отправленных\n\n"
+    
+    status_emoji = {
+        "pending": "⏳",
+        "approved": "✅",
+        "rejected": "❌"
+    }
+    status_text = {
+        "pending": "На модерации",
+        "approved": "Добавлен",
+        "rejected": "Отклонен"
+    }
+    
+    # Отображаем треки на текущей странице
+    for track in page_tracks:
+        status = track.get("status", "approved")
+        emoji = status_emoji.get(status, "✅")
+        status_label = status_text.get(status, "Добавлен")
+        anon_label = " (🤫 анонимно)" if track.get("anon") else ""
+        
+        added_at = track.get("added_at")
+        added_date = format_datetime(added_at) if added_at else "Неизвестно"
+        
+        text += f"{emoji} <b>{track.get('title', 'Неизвестно')}</b>{anon_label}\n"
+        text += f"   📊 {status_label}\n"
+        text += f"   📅 Добавлен: {added_date}\n"
+        
+        if status in ("approved", "rejected"):
+            moderated_at = track.get("moderated_at")
+            if moderated_at:
+                moderated_date = format_datetime(moderated_at)
+                action = "Одобрен" if status == "approved" else "Отклонен"
+                text += f"   {emoji} {action}: {moderated_date}\n"
+        text += "\n"
+    
+    # Клавиатура с пагинацией
+    kb = InlineKeyboardBuilder()
+    
+    # Пагинация (если страниц больше 1)
+    if total_pages > 1:
+        nav_kb = build_my_tracks_page_nav(room_id, page, total_pages)
+        for row in nav_kb.export():
+            kb.row(*row)
+    
+    kb.button(text="🔙 Назад к комнате", callback_data=f"room:{room_id}")
+    
+    await callback.message.edit_text( # type: ignore
+        text,
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML"
+    )
+
+
+def build_my_tracks_page_nav(room_id: str, current_page: int, total_pages: int) -> InlineKeyboardBuilder:
+    """Создает навигацию по страницам для 'Мои треки'"""
+    kb = InlineKeyboardBuilder()
+
+    # показываем максимум 5 номеров
+    window = 5
+    start = max(0, current_page - window // 2)
+    end = min(total_pages, start + window)
+
+    # если ближе к концу, сдвигаем окно
+    if end - start < window:
+        start = max(0, end - window)
+
+    # кнопка "влево"
+    if current_page > 0 and total_pages > window:
+        kb.button(text="⬅️", callback_data=f"my_tracks:{room_id}:{current_page - 1}")
+
+    # номера страниц
+    for i in range(start, end):
+        label = f"[{i+1}]" if i == current_page else str(i+1)
+        kb.button(text=label, callback_data=f"my_tracks:{room_id}:{i}")
+
+    # кнопка "вправо"
+    if current_page < total_pages - 1 and total_pages > window:
+        kb.button(text="➡️", callback_data=f"my_tracks:{room_id}:{current_page + 1}")
+
+    # всё в одну строку
+    kb.adjust(window + 2)
+    return kb
