@@ -17,4 +17,4 @@ mutagen==1.47.0
 aiofiles==25.1.0
 
 # Optional (if used)
-SQLAlchemy==2.0.45
+SQLAlchemy==2.0.46
