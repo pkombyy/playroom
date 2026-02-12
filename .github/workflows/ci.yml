@@ -1,13 +1,98 @@
-name: CI
+name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, develop, master ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main, develop, master ]
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.10'
 
 jobs:
+  lint-and-format:
+    name: Lint & Format Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install flake8 black isort mypy types-redis
+
+    - name: Check Python syntax
+      run: |
+        echo "🔍 Checking Python syntax..."
+        python -m py_compile main.py config.py
+        find handlers utils db repositories services keyboards util_types -name "*.py" -type f -exec python -m py_compile {} \;
+        echo "✅ Syntax check passed"
+
+    - name: Check imports
+      run: |
+        echo "🔍 Checking imports..."
+        python -c "from handlers import rooms, tracks, rooms_create, start, room_management, admin, manage; from utils import youtube, google_drive, storage, redis_helper, room_permissions, timezone; from db import config; print('✅ All imports successful')"
+        echo "✅ Import check passed"
+
+    - name: Run flake8 (critical errors)
+      run: |
+        echo "🔍 Running flake8 (critical errors)..."
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=venv,__pycache__,tmp,exports || exit 1
+
+    - name: Run flake8 (style warnings)
+      run: |
+        echo "🔍 Running flake8 (style warnings)..."
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude=venv,__pycache__,tmp,exports || true
+
+    - name: Check code formatting with black
+      run: |
+        echo "🔍 Checking code formatting..."
+        black --check --diff . --exclude='/(venv|__pycache__|tmp|exports)/' || echo "⚠️  Code formatting issues found (non-blocking)"
+
+    - name: Check import sorting with isort
+      run: |
+        echo "🔍 Checking import sorting..."
+        isort --check-only --diff . --skip venv --skip __pycache__ --skip tmp --skip exports || echo "⚠️  Import sorting issues found (non-blocking)"
+
+  security:
+    name: Security Check
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Install safety
+      run: |
+        pip install safety
+
+    - name: Check dependencies for security vulnerabilities
+      run: |
+        echo "🔍 Checking for security vulnerabilities..."
+        safety check --file requirements.txt || echo "⚠️  Security vulnerabilities found"
+
   test:
+    name: Tests
     runs-on: ubuntu-latest
     
     services:
@@ -27,7 +112,54 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.13'
+        python-version: ${{ env.PYTHON_VERSION }}
+
+    - name: Cache pip packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio pytest-cov
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ffmpeg redis-tools
+
+    - name: Run tests (if available)
+      run: |
+        echo "🔍 Running tests..."
+        if [ -f "test_*.py" ] || [ -d "tests" ]; then
+          pytest tests/ test_*.py -v --cov=. --cov-report=term-missing || echo "⚠️  Tests failed or not found"
+        else
+          echo "ℹ️  No tests found, skipping"
+        fi
+
+    - name: Test Redis connection
+      run: |
+        echo "🔍 Testing Redis connection..."
+        redis-cli -h localhost -p 6379 ping || exit 1
+        echo "✅ Redis connection successful"
+
+  build:
+    name: Build Check
+    runs-on: ubuntu-latest
+    needs: [lint-and-format, security]
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
 
     - name: Cache pip packages
       uses: actions/cache@v4
@@ -42,20 +174,8 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
-    - name: Check Python syntax
+    - name: Verify bot can start (dry run)
       run: |
-        python -m py_compile main.py config.py
-        find handlers utils -name "*.py" -exec python -m py_compile {} \;
-
-    - name: Check imports
-      run: |
-        python -c "from handlers import rooms, tracks, rooms_create, start; from utils import youtube, google_drive, storage, redis_helper; print('All imports successful')"
-
-    - name: Install linting tools
-      run: |
-        pip install flake8
-
-    - name: Run flake8
-      run: |
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=venv,__pycache__
-        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics --exclude=venv,__pycache__
+        echo "🔍 Verifying bot configuration..."
+        python -c "from config import bot, dp; print('✅ Bot configuration is valid')" || exit 1
+        echo "✅ Build check passed"

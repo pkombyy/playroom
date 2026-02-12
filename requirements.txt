@@ -9,8 +9,8 @@ google-auth-oauthlib==1.2.3
 google-auth==2.41.1
 google-auth-httplib2==0.3.0
 
-# Media processing
-yt-dlp==2025.12.8
+# Media processing (yt-dlp[default] включает yt-dlp-ejs для обхода ограничений YouTube)
+yt-dlp[default]>=2026.1.0
 mutagen==1.47.0
 
 # Utilities

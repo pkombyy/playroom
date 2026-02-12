@@ -298,6 +298,11 @@ async def show_moderation_queue(callback: types.CallbackQuery):
         return
     
     # Получаем pending треки через репозиторий (автоматически возвращает в pending при неактивности)
+    # Сначала принудительно восстанавливаем все потерянные треки
+    restored = await moderation_repo.restore_all_pending_from_user_tracks(room_id)
+    if restored > 0:
+        print(f"✅ Восстановлено {restored} потерянных треков для комнаты {room_id}")
+    
     pending_tracks = await moderation_repo.get_pending_tracks(room_id)
     
     if not pending_tracks:
@@ -412,11 +417,15 @@ async def mod_approve_track(callback: types.CallbackQuery):
         result = await moderation_service.approve_track(room_id, token, admin_id)
         title = result["track"]["title"]
         user_id = result["user_id"]
+        already_exists = result.get("already_exists", False)
         
-        # Уведомляем пользователя через сервис
-        await notification_service.notify_track_approved(user_id, room_id, title)
-        
-        await callback.answer("✅ Трек одобрен и добавлен в плейлист")
+        if already_exists:
+            # Трек уже был в плейлисте - просто удалили дубликат из модерации
+            await callback.answer("✅ Дубликат удален из модерации. Трек уже в плейлисте.")
+        else:
+            # Уведомляем пользователя через сервис
+            await notification_service.notify_track_approved(user_id, room_id, title)
+            await callback.answer("✅ Трек одобрен и добавлен в плейлист")
         
         # Переходим к следующему треку в модерации
         await show_moderation_queue(callback)

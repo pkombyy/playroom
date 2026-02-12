@@ -83,9 +83,29 @@ class ModerationService:
         file_hash = track_data.get("file")
         existing_index = await self.track_repo.find_track_by_hash(room_id, file_hash)
         if existing_index is not None:
-            # Удаляем из модерации
+            # Трек уже существует в плейлисте - просто удаляем из модерации и обновляем статус
             await self.moderation_repo.remove_from_moderation_queue(room_id, token)
-            raise ValueError("Трек уже существует в плейлисте")
+            
+            # Обновляем статус трека пользователя на approved (если он был pending)
+            user_id = track_data.get("user_id")
+            if user_id:
+                # Находим все user_tracks с этим хешем и обновляем их статус
+                user_tracks = await self.track_repo.get_user_tracks(user_id, room_id)
+                for user_track in user_tracks:
+                    if user_track.get("file") == file_hash and user_track.get("status") == "pending":
+                        await self.track_repo.update_user_track_status(
+                            user_id, room_id, user_track.get("token"), "approved"
+                        )
+            
+            # Возвращаем информацию о существующем треке
+            tracks = await self.track_repo.get_all_tracks(room_id)
+            existing_track = tracks[existing_index] if existing_index < len(tracks) else None
+            
+            return {
+                "track": existing_track or track_data,
+                "user_id": user_id,
+                "already_exists": True
+            }
         
         # Устанавливаем статус in_progress
         await self.moderation_repo.set_track_in_progress(room_id, token, admin_id)

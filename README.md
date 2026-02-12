@@ -44,11 +44,24 @@ python main.py
 
 ## CI/CD
 
-Проект использует GitHub Actions для автоматической проверки кода.
+Проект использует GitHub Actions для автоматической проверки кода и деплоя.
+
+### Автоматические проверки
+
+CI pipeline запускается автоматически при каждом push и pull request и включает:
+
+- ✅ Проверка синтаксиса Python
+- ✅ Проверка импортов
+- ✅ Линтинг с flake8
+- ✅ Проверка форматирования кода (black)
+- ✅ Проверка сортировки импортов (isort)
+- ✅ Проверка безопасности зависимостей
+- ✅ Запуск тестов
+- ✅ Проверка подключения к Redis
 
 ### Локальная проверка
 
-Запустите скрипт для проверки кода локально:
+Запустите скрипт для проверки кода локально (аналогично CI):
 ```bash
 ./ci_check.sh
 ```
@@ -57,13 +70,25 @@ python main.py
 ```bash
 # Проверка синтаксиса
 python -m py_compile main.py config.py
+find handlers utils db repositories services -name "*.py" -exec python -m py_compile {} \;
 
 # Проверка импортов
 python -c "from handlers import rooms, tracks, rooms_create, start; from utils import youtube, google_drive, storage, redis_helper; print('OK')"
 
 # Линтинг
-flake8 . --exclude=venv,__pycache__
+flake8 . --exclude=venv,__pycache__,tmp,exports
+
+# Форматирование (проверка)
+black --check . --exclude='/(venv|__pycache__|tmp|exports)/'
 ```
+
+### Деплой
+
+Автоматический деплой настраивается через workflow `deploy.yml`. Подробнее см. [.github/workflows/README.md](.github/workflows/README.md)
+
+### Dependabot
+
+Проект использует Dependabot для автоматического обновления зависимостей. PR с обновлениями создаются еженедельно.
 
 ## Асинхронная загрузка треков
 

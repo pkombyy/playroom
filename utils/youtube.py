@@ -54,11 +54,18 @@ async def download_track(query: str) -> dict | None:
             "default_search": "ytsearch1",
             "quiet": True,
             "outtmpl": outtmpl,
+            "ffmpeg_location": "/usr/bin",
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
             }],
+            # Обход 403: android-клиент часто обходит блокировки YouTube
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web"],
+                },
+            },
         }
         
         # Добавляем cookies только если файл существует

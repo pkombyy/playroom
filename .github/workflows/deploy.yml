@@ -1,0 +1,157 @@
+name: Deploy
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+jobs:
+  # Сначала проверяем код
+  ci-checks:
+    name: Run CI Checks Before Deploy
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Quick syntax check
+      run: |
+        python -m py_compile main.py config.py
+        find handlers utils db repositories services -name "*.py" -type f -exec python -m py_compile {} \;
+
+  deploy:
+    name: Deploy to Server
+    runs-on: ubuntu-latest
+    needs: [ci-checks]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Create deployment package
+      run: |
+        echo "📦 Creating deployment package..."
+        mkdir -p deploy
+        tar -czf deploy/bot.tar.gz \
+          --exclude='venv' \
+          --exclude='__pycache__' \
+          --exclude='*.pyc' \
+          --exclude='.git' \
+          --exclude='tmp' \
+          --exclude='exports' \
+          --exclude='bot.log' \
+          --exclude='.env' \
+          main.py config.py handlers/ utils/ db/ repositories/ services/ keyboards/ util_types/ requirements.txt start_bot.sh ci_check.sh
+        echo "✅ Deployment package created"
+
+    - name: Upload deployment artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: bot-deployment
+        path: deploy/bot.tar.gz
+        retention-days: 7
+
+    # Автоматический деплой на сервер (если настроены секреты)
+    - name: Deploy to server via SSH
+      if: secrets.DEPLOY_ENABLED == 'true' && secrets.DEPLOY_HOST != ''
+      uses: appleboy/scp-action@v0.1.7
+      with:
+        host: ${{ secrets.DEPLOY_HOST }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.DEPLOY_SSH_KEY }}
+        port: ${{ secrets.DEPLOY_PORT || 22 }}
+        source: "deploy/bot.tar.gz"
+        target: "/var/playroom"
+        strip_components: 0
+
+    - name: Execute deployment script on server
+      if: secrets.DEPLOY_ENABLED == 'true' && secrets.DEPLOY_HOST != ''
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ secrets.DEPLOY_HOST }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.DEPLOY_SSH_KEY }}
+        port: ${{ secrets.DEPLOY_PORT || 22 }}
+        script: |
+          cd /var/playroom
+          
+          echo "📦 Extracting deployment package..."
+          tar -xzf bot.tar.gz -C . --strip-components=0 || {
+            # Если файлы уже есть, просто обновим
+            tar -xzf bot.tar.gz
+          }
+          
+          echo "📦 Installing/updating dependencies..."
+          if [ -d "venv" ]; then
+            source venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+          else
+            python3 -m venv venv
+            source venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.txt
+          fi
+          
+          echo "🔄 Restarting bot..."
+          chmod +x start_bot.sh
+          ./start_bot.sh
+          
+          echo "✅ Deployment completed!"
+          echo "📝 Checking bot status..."
+          sleep 3
+          if ps aux | grep -q "[p]ython.*main.py"; then
+            echo "✅ Bot is running"
+          else
+            echo "⚠️  Bot might not be running, check logs: tail -f /var/playroom/bot.log"
+          fi
+
+    - name: Deployment summary
+      run: |
+        echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ secrets.DEPLOY_ENABLED }}" == "true" ] && [ -n "${{ secrets.DEPLOY_HOST }}" ]; then
+          echo "✅ **Автоматический деплой выполнен на сервер**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Бот должен быть автоматически обновлен и перезапущен." >> $GITHUB_STEP_SUMMARY
+          echo "Проверьте логи на сервере: \`tail -f /var/playroom/bot.log\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "ℹ️  **Автоматический деплой не настроен**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Для включения автоматического деплоя настройте GitHub Secrets (см. [DEPLOYMENT.md](.github/DEPLOYMENT.md)):" >> $GITHUB_STEP_SUMMARY
+          echo "- \`DEPLOY_ENABLED\` = \`true\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`DEPLOY_HOST\` - адрес сервера" >> $GITHUB_STEP_SUMMARY
+          echo "- \`DEPLOY_USER\` - пользователь SSH" >> $GITHUB_STEP_SUMMARY
+          echo "- \`DEPLOY_SSH_KEY\` - приватный SSH ключ" >> $GITHUB_STEP_SUMMARY
+          echo "- \`DEPLOY_PORT\` - порт SSH (опционально, по умолчанию 22)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Или скачайте артефакт \`bot-deployment\` и разверните вручную:" >> $GITHUB_STEP_SUMMARY
+          echo "1. \`tar -xzf bot.tar.gz\`" >> $GITHUB_STEP_SUMMARY
+          echo "2. \`pip install -r requirements.txt\`" >> $GITHUB_STEP_SUMMARY
+          echo "3. \`./start_bot.sh\`" >> $GITHUB_STEP_SUMMARY
+        fi

@@ -62,6 +62,9 @@ class TrackRepository(BaseRepository):
         """Находит индекс трека по хешу файла"""
         tracks = await self.get_all_tracks(room_id)
         for i, track in enumerate(tracks):
+            # Пропускаем удаленные треки
+            if track.get("__deleted__") is True:
+                continue
             if track.get("file") == file_hash:
                 return i
         return None
@@ -71,6 +74,9 @@ class TrackRepository(BaseRepository):
         tracks = await self.get_all_tracks(room_id)
         title_lower = title.lower()
         for i, track in enumerate(tracks):
+            # Пропускаем удаленные треки
+            if track.get("__deleted__") is True:
+                continue
             if track.get("title", "").lower() == title_lower:
                 return i
         return None

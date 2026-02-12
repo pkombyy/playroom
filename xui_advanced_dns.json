@@ -1,0 +1,60 @@
+{
+  "servers": [
+    {
+      "address": "77.88.8.8",
+      "domains": [
+        "geosite:ru"
+      ],
+      "expectIPs": [
+        "geoip:ru"
+      ],
+      "skipFallback": false
+    },
+    {
+      "address": "77.88.8.1",
+      "domains": [
+        "geosite:ru"
+      ],
+      "expectIPs": [
+        "geoip:ru"
+      ],
+      "skipFallback": false
+    },
+    {
+      "address": "https://1.1.1.1/dns-query",
+      "domains": [
+        "geosite:geolocation-!ru"
+      ],
+      "expectIPs": [
+        "geoip:!ru"
+      ],
+      "skipFallback": false
+    },
+    {
+      "address": "https://8.8.8.8/dns-query",
+      "domains": [
+        "geosite:geolocation-!ru"
+      ],
+      "skipFallback": false
+    },
+    {
+      "address": "tls://1.1.1.1",
+      "domains": [
+        "geosite:geolocation-!ru"
+      ],
+      "skipFallback": false
+    },
+    {
+      "address": "tls://8.8.8.8",
+      "domains": [
+        "geosite:geolocation-!ru"
+      ],
+      "skipFallback": false
+    },
+    "localhost"
+  ],
+  "queryStrategy": "UseIPv4",
+  "disableCache": false,
+  "disableFallback": false,
+  "tag": "dns"
+}
