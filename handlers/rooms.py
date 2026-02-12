@@ -13,7 +13,7 @@ from typing import Union, Set, cast
 from aiogram import Router, types, F
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import redis, bot as bot_instance
+from config import redis, bot as bot_instance, TG_MAX_FILE_BYTES
 from utils.google_drive import upload_to_drive
 from utils.redis_helper import redis_safe
 from utils.storage import RoomContext
@@ -23,11 +23,13 @@ from repositories.track_repository import TrackRepository
 from repositories.room_repository import RoomRepository
 from services.room_service import RoomService
 from services.track_service import TrackService
+from services.moderation_service import ModerationService
 from services.notification_service import NotificationService
 
 # Инициализация сервисов и репозиториев
 room_service = RoomService()
 track_service = TrackService()
+moderation_service = ModerationService()
 notification_service = NotificationService()
 track_repo = TrackRepository()
 room_repo = RoomRepository()
@@ -170,36 +172,68 @@ async def open_room(callback: types.CallbackQuery):
     text = f"🎧 <b>{room_name}</b>\n"
     text += f"📀 Треков всего: <b>{total_tracks}</b>\n\n"
 
-    # соавторы
+    # соавторы - рейтинг
     if author_data or anon_count:
-        text += "👥 <b>Соавторы плейлиста:</b>\n"
-        sorted_authors = sorted(author_data.items(), key=lambda x: x[1]["count"], reverse=True)
+        text += "🏆 <b>Рейтинг соавторов:</b>\n"
         
-        for author_name, data in sorted_authors:
-            count = data["count"]
-            user_id = data.get("user_id")
+        # Создаем список всех участников рейтинга (авторы + анонимные)
+        ranking_list = []
+        
+        # Добавляем авторов
+        for author_name, data in author_data.items():
+            ranking_list.append({
+                "name": author_name,
+                "count": data["count"],
+                "user_id": data.get("user_id"),
+                "is_anon": False
+            })
+        
+        # Добавляем анонимные треки, если есть
+        if anon_count > 0:
+            ranking_list.append({
+                "name": "🤫 Анонимно",
+                "count": anon_count,
+                "user_id": None,
+                "is_anon": True
+            })
+        
+        # Сортируем по количеству треков (по убыванию)
+        ranking_list.sort(key=lambda x: x["count"], reverse=True)
+        
+        # Выводим рейтинг
+        for rank, item in enumerate(ranking_list, start=1):
+            count = item["count"]
+            author_name = item["name"]
+            user_id = item.get("user_id")
+            is_anon = item.get("is_anon", False)
             
-            # Если имя пустое или содержит только пробелы, получаем username
-            display_name = author_name
-            if not author_name or author_name.strip() == "" or author_name.strip() == "ㅤ":
-                if user_id:
+            # Если это не анонимный и имя пустое, получаем username
+            if not is_anon:
+                display_name = author_name
+                if not author_name or author_name.strip() == "" or author_name.strip() == "ㅤ":
                     try:
                         user = await callback.bot.get_chat(user_id)  # type: ignore
                         display_name = user.username and f"@{user.username}" or (user.full_name or f"User {user_id}")
                     except Exception:
                         display_name = f"User {user_id}" if user_id else "Неизвестно"
+                    else:
+                        display_name = "Неизвестно"
                 else:
-                    display_name = "Неизвестно"
+                    # Очищаем имя от странных символов
+                    display_name = author_name.strip()
+                    # Удаляем невидимые символы и биди-маркеры
+                    display_name = ''.join(c for c in display_name if c.isprintable() and ord(c) < 0x10000)
             else:
-                # Очищаем имя от странных символов
-                display_name = author_name.strip()
-                # Удаляем невидимые символы и биди-маркеры
-                display_name = ''.join(c for c in display_name if c.isprintable() and ord(c) < 0x10000)
+                display_name = author_name
             
-            text += f"• {display_name} — {count}\n"
+            # Для первого места - корона, для остальных - номер
+            if rank == 1:
+                rank_display = "👑"
+            else:
+                rank_display = f"#{rank}"
+            
+            text += f"{rank_display} {display_name} — {count}\n"
         
-        if anon_count:
-            text += f"• 🤫 Анонимно — {anon_count}\n"
         text += "\n"
 
     # участники
@@ -237,7 +271,8 @@ async def open_room(callback: types.CallbackQuery):
     # управление
     kb.row(
         types.InlineKeyboardButton(text="➕ Добавить трек", callback_data=f"addtrack:{room_id}"),
-        types.InlineKeyboardButton(text="📦 Экспортировать", callback_data=f"export:{room_id}")
+        types.InlineKeyboardButton(text="📦 Экспорт", callback_data=f"export:{room_id}"),
+        types.InlineKeyboardButton(text="📥 Импорт", callback_data=f"import_list:{room_id}")
     )
     kb.row(
         types.InlineKeyboardButton(text="🎵 Мои треки", callback_data=f"my_tracks:{room_id}")
@@ -556,102 +591,185 @@ async def admin_approve_track(callback: types.CallbackQuery):
     await view_track_info(fake_callback)
 
 
-# ---------- экспорт архива (максимальное сжатие + локальная папка) ----------
+# ---------- Импорт: отображение всех треков комнаты файлами с кнопкой Назад ----------
+@router.callback_query(F.data.startswith("import_list:"))
+async def import_list_tracks(callback: types.CallbackQuery):
+    """Отправляет все треки комнаты как аудиофайлы в чат, в конце — кнопка Назад"""
+    room_id = callback.data.split(":")[1]  # type: ignore
+    user_id = callback.from_user.id  # type: ignore
+
+    members = await room_repo.get_room_members(room_id)
+    if user_id not in members:
+        await callback.answer("❌ Вы не состоите в этой комнате.", show_alert=True)
+        return
+
+    tracks_data = await track_repo.get_all_tracks(room_id)
+    # Только одобренные треки (без удалённых)
+    tracks_data = [t for t in tracks_data if not t.get("__deleted__") and t.get("status", "approved") == "approved"]
+
+    if not tracks_data:
+        await callback.answer("В комнате нет треков.", show_alert=True)
+        return
+
+    msg_ids = []
+    chat_id = callback.message.chat.id  # type: ignore
+
+    await callback.answer("⏳ Отправляю треки...")
+
+    for i, track in enumerate(tracks_data, 1):
+        file_hash = track.get("file")
+        title = track.get("title", "Без названия")
+        caption = f"🎵 {title} ({i}/{len(tracks_data)})"
+
+        cache_path = CACHE_DIR / f"{file_hash}.mp3"
+        if not cache_path.exists():
+            continue
+        if cache_path.stat().st_size > TG_MAX_FILE_BYTES:
+            continue  # Пропускаем — превышает лимит Telegram (50 МБ)
+
+        try:
+            audio_data = cache_path.read_bytes()
+            input_file = types.BufferedInputFile(audio_data, filename=f"{title[:50]}.mp3")
+            msg = await callback.bot.send_audio(  # type: ignore
+                chat_id=chat_id,
+                audio=input_file,
+                title=title[:30] if title else None,
+                caption=caption
+            )
+            msg_ids.append(msg.message_id)
+        except Exception as e:
+            print(f"❌ Ошибка отправки трека {title}: {e}")
+            continue
+
+    if not msg_ids:
+        await callback.bot.send_message(chat_id, "⚠️ Не удалось отправить треки (файлы не найдены в кэше).")  # type: ignore
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Назад к комнате", callback_data=f"import_back:{room_id}")
+    msg = await callback.bot.send_message(  # type: ignore
+        chat_id,
+        f"🎵 Отправлено {len(msg_ids)} треков из комнаты",
+        reply_markup=kb.as_markup()
+    )
+    msg_ids.append(msg.message_id)
+
+    await redis_safe(redis.set(
+        f"import_list_msgs:{user_id}:{room_id}",
+        json.dumps(msg_ids),
+        ex=3600
+    ))
+
+
+@router.callback_query(F.data.startswith("import_back:"))
+async def import_back_to_room(callback: types.CallbackQuery):
+    """Удаляет все треки из чата и возвращает на страницу комнаты"""
+    room_id = callback.data.split(":")[1]  # type: ignore
+    user_id = callback.from_user.id  # type: ignore
+    chat_id = callback.message.chat.id  # type: ignore
+
+    key = f"import_list_msgs:{user_id}:{room_id}"
+    raw = await redis_safe(redis.get(key))
+    if raw:
+        try:
+            msg_ids = json.loads(raw)
+            for mid in msg_ids:
+                try:
+                    await callback.bot.delete_message(chat_id=chat_id, message_id=mid)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await redis_safe(redis.delete(key))
+
+    fake = SimpleNamespace(
+        data=f"room:{room_id}",
+        from_user=callback.from_user,
+        message=callback.message,
+        bot=callback.bot
+    )
+    await open_room(fake)
+    await callback.answer()
+
+
+# ---------- экспорт архива (максимальное сжатие + кэширование) ----------
 @router.callback_query(F.data.startswith("export:"))
 async def export_playlist(callback: types.CallbackQuery):
-    import io, zipfile, json, shutil
-    from pathlib import Path
-    from mutagen.mp3 import MP3
-    from mutagen.id3._util import ID3NoHeaderError
-    from utils.redis_helper import redis_safe
-    from config import redis
+    import shutil
 
     await callback.answer("⏳ Архив формируется, подождите...", show_alert=False)
     room_id = callback.data.split(":")[1]  # type: ignore
 
-    # ---------- утилита: экспорт папки комнаты ----------
-    async def export_room_to_folder(room_id: str) -> Path:
-        """
-        Собирает все mp3-файлы комнаты в отдельную папку exports/{room_id}/
-        Возвращает путь к итоговой папке.
-        """
-        EXPORT_DIR = Path("exports")
-        CACHE_DIR = Path("tmp/music_cache")
+    EXPORT_DIR = Path("exports")
+    EXPORT_CACHE_DIR = Path("exports/cache")
+    MUSIC_CACHE = CACHE_DIR  # tmp/music_cache
 
-        EXPORT_DIR.mkdir(exist_ok=True)
-        room_folder = EXPORT_DIR / room_id
-
-        if room_folder.exists():
-            shutil.rmtree(room_folder)
-        room_folder.mkdir()
-
-        # получаем треки через репозиторий
-        tracks = await track_repo.get_all_tracks(room_id)
-
-        if not tracks:
-            raise ValueError(f"Комната {room_id} пуста — треков нет.")
-
-        copied = 0
-        skipped = 0
-        for t in tracks:
-            file_hash = t.get("file")
-            title = t.get("title", file_hash)
-            src = CACHE_DIR / f"{file_hash}.mp3"
-
-            if not src.exists():
-                skipped += 1
-                continue
-
-            safe_name = "".join(c for c in title if c.isalnum() or c in " _-").strip() or file_hash
-            dst = room_folder / f"{safe_name}.mp3"
-
-            shutil.copy2(src, dst)
-            copied += 1
-
-        print(f"[export] Room {room_id}: copied {copied}, skipped {skipped}")
-        return room_folder
-
-    # ---------- экспорт архива ----------
-    try:
-        room_folder = await export_room_to_folder(room_id)
-    except ValueError as e:
-        await callback.answer(str(e), show_alert=True)
-        return
-    except Exception as e:
-        print(f"[export] Ошибка при создании папки экспорта: {e}")
-        await callback.answer("❌ Ошибка при создании архива.", show_alert=True)
+    # --- Получаем треки и строим хеш контента ---
+    tracks = await track_repo.get_all_tracks(room_id)
+    if not tracks:
+        await callback.answer("Комната пуста — треков нет.", show_alert=True)
         return
 
-    # --- Параметры архива ---
-    # Увеличиваем размер частей для большего количества треков (более 400)
-    MAX_SIZE_MB = 48  # Максимальный размер файла в Telegram
-    MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
-    part = 1
+    valid = []
+    for t in tracks:
+        fh = t.get("file")
+        if not fh:
+            continue
+        src = MUSIC_CACHE / f"{fh}.mp3"
+        if not src.exists():
+            continue
+        if src.stat().st_size > TG_MAX_FILE_BYTES:
+            continue
+        title = t.get("title", fh)
+        safe = "".join(c for c in title if c.isalnum() or c in " _-").strip() or fh
+        valid.append((fh, safe))
+    valid.sort(key=lambda x: x[1].lower())
 
-    def strip_tags(mp3_path: Path) -> bytes:
-        """Удаляем ID3-теги и возвращаем чистый аудиопоток для лучшего сжатия."""
+    if not valid:
+        await callback.answer("⚠️ Нет треков для экспорта (файлы не найдены или превышают лимит).", show_alert=True)
+        return
+
+    content_hash = hashlib.md5("|".join(fh for fh, _ in valid).encode()).hexdigest()[:16]
+    cache_key = f"{room_id}_{content_hash}"
+    cache_dir = EXPORT_CACHE_DIR / cache_key
+
+    # --- Используем кэш, если архив уже собран ---
+    cached_parts = sorted(cache_dir.glob("part*.zip")) if cache_dir.exists() else []
+    if cached_parts:
+        print(f"[export] Кэш-попадание: {cache_key}")
+        total_files = len(valid)
+        for i, p in enumerate(cached_parts, 1):
+            data = p.read_bytes()
+            fname = f"{room_id}_part{i}.zip" if len(cached_parts) > 1 else f"{room_id}.zip"
+            cap = "📦 Архив комнаты" if len(cached_parts) == 1 else f"📦 Часть {i}"
+            await callback.message.answer_document(  # type: ignore
+                types.BufferedInputFile(data, filename=fname),
+                caption=f"{cap} (всего {total_files} треков)"
+            )
+        await callback.message.answer(  # type: ignore
+            f"✅ Архив из кэша\n📦 Частей: {len(cached_parts)}\n🎵 Треков: {total_files}",
+            parse_mode="HTML"
+        )
+        return
+
+    # --- Собираем архив и сохраняем в кэш ---
+    EXPORT_DIR.mkdir(exist_ok=True)
+    EXPORT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    room_folder = EXPORT_DIR / room_id
+    if room_folder.exists():
+        shutil.rmtree(room_folder)
+    room_folder.mkdir()
+
+    for fh, safe in valid:
+        src = MUSIC_CACHE / f"{fh}.mp3"
+        dst = room_folder / f"{safe}.mp3"
         try:
-            audio = MP3(mp3_path)
-            audio.delete()  # удаляем ID3-теги для уменьшения размера
-            buf = io.BytesIO()
-            audio.save(buf)
-            return buf.getvalue()
-        except ID3NoHeaderError:
-            with open(mp3_path, "rb") as f:
-                return f.read()
+            shutil.copy2(src, dst)
+        except OSError:
+            pass
 
-    # --- Сбор архива с максимальным сжатием ---
-    current_buf = io.BytesIO()
-    current_zip = zipfile.ZipFile(
-        current_buf,
-        "w",
-        compression=zipfile.ZIP_LZMA,  # LZMA - максимальное сжатие
-        compresslevel=9  # Максимальный уровень сжатия
-    )
-
-    mp3_files = sorted(room_folder.glob("*.mp3"))  # Сортируем для предсказуемости
+    mp3_files = sorted(room_folder.glob("*.mp3"))
     total_files = len(mp3_files)
-    
     if total_files == 0:
         await callback.answer("⚠️ Нет треков для экспорта.", show_alert=True)
         try:
@@ -659,53 +777,65 @@ async def export_playlist(callback: types.CallbackQuery):
         except Exception:
             pass
         return
-    
+
+    MAX_SIZE_BYTES = int(43 * 1024 * 1024)  # 43 MB
+
+    def _new_zip():
+        buf = io.BytesIO()
+        zf = zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9)
+        return buf, zf
+
     try:
-        for idx, mp3_path in enumerate(mp3_files, 1):
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        current_buf, current_zip = _new_zip()
+        tracks_in_part = 0
+        part = 1
+
+        for mp3_path in mp3_files:
             try:
-                data = strip_tags(mp3_path)
-                # Используем относительный путь для лучшего сжатия
-                current_zip.writestr(mp3_path.name, data, compress_type=zipfile.ZIP_LZMA)
+                data = mp3_path.read_bytes()
+                current_zip.writestr(mp3_path.name, data, compress_type=zipfile.ZIP_DEFLATED)
+                tracks_in_part += 1
             except Exception as e:
                 print(f"[export] Ошибка при обработке {mp3_path.name}: {e}")
-                continue  # Пропускаем проблемный файл
+                continue
 
-            # Проверяем размер архива (с запасом для заголовков)
             current_size = current_buf.tell()
-            if current_size >= MAX_SIZE_BYTES * 0.95:  # 95% от максимума для запаса
+            if current_size >= MAX_SIZE_BYTES:
                 current_zip.close()
                 current_buf.seek(0)
+                data = current_buf.read()
+                cache_part = cache_dir / f"part{part}.zip"
+                cache_part.write_bytes(data)
+                fname = f"{room_id}_part{part}.zip"
                 await callback.message.answer_document(  # type: ignore
-                    types.BufferedInputFile(current_buf.read(), filename=f"{room_id}_part{part}.zip"),
-                    caption=f"📦 Часть {part} ({idx}/{total_files} треков)"
+                    types.BufferedInputFile(data, filename=fname),
+                    caption=f"📦 Часть {part} ({tracks_in_part} треков)"
                 )
-            part += 1
-            current_buf = io.BytesIO()
-            current_zip = zipfile.ZipFile(
-                current_buf,
-                "w",
-                compression=zipfile.ZIP_LZMA,
-                compresslevel=9
-            )
+                part += 1
+                current_buf, current_zip = _new_zip()
+                tracks_in_part = 0
 
-        # --- Финальный архив ---
-        if current_buf.tell() > 0:  # Если есть данные в буфере
+        if tracks_in_part > 0:
             current_zip.close()
             current_buf.seek(0)
+            data = current_buf.read()
+            cache_part = cache_dir / f"part{part}.zip"
+            cache_part.write_bytes(data)
+            fname = f"{room_id}.zip" if part == 1 else f"{room_id}_part{part}.zip"
+            cap = "📦 Архив комнаты" if part == 1 else f"📦 Часть {part}"
             await callback.message.answer_document(  # type: ignore
-                types.BufferedInputFile(current_buf.read(), filename=f"{room_id}_part{part}.zip"),
-                caption=f"📦 Финальная часть архива ({total_files} треков всего)"
+                types.BufferedInputFile(data, filename=fname),
+                caption=f"{cap} ({tracks_in_part} треков, всего {total_files})"
             )
 
-        # Удаляем временную папку после экспорта
         try:
             shutil.rmtree(room_folder)
         except Exception as e:
             print(f"[export] Не удалось удалить временную папку: {e}")
-        
-        # Уведомляем только запросившего пользователя
-        await callback.message.answer( # type: ignore
-            f"✅ Архив комнаты готов!\n📦 Всего частей: {part}\n🎵 Треков: {total_files}",
+
+        await callback.message.answer(  # type: ignore
+            f"✅ Архив комнаты готов!\n📦 Частей: {part}\n🎵 Треков: {total_files}",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -720,7 +850,10 @@ async def export_playlist(callback: types.CallbackQuery):
             shutil.rmtree(room_folder)
         except Exception:
             pass
-        await callback.answer("❌ Ошибка при создании архива.", show_alert=True)
+        try:
+            await callback.answer("❌ Ошибка при создании архива.", show_alert=True)
+        except Exception:
+            await callback.message.answer("❌ Ошибка при создании архива.")
 
 # ---------- очистка плейлиста ----------
 @router.callback_query(F.data.startswith("clear_confirm:"))

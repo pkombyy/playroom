@@ -10,6 +10,9 @@ from aiogram.client.default import DefaultBotProperties
 load_dotenv(override=True)
 
 API_TOKEN = os.getenv("API_TOKEN")
+
+# Лимит Telegram для документов/аудио (50 МБ)
+TG_MAX_FILE_BYTES = 50 * 1024 * 1024
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = cast(int,os.getenv("REDIS_PORT"))
 REDIS_DB = cast(int,os.getenv("REDIS_DB"))
