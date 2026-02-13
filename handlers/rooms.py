@@ -692,6 +692,24 @@ async def import_back_to_room(callback: types.CallbackQuery):
     await callback.answer()
 
 
+def _safe_archive_name(name: str, room_id: str, strip_emoji: bool = False) -> str:
+    """Безопасное имя для архива. strip_emoji=True — без эмодзи (fallback)."""
+    if not name or not name.strip():
+        return room_id
+    try:
+        if strip_emoji:
+            s = "".join(
+                c for c in name
+                if (c.isalnum() or c in " _-." or "\u0400" <= c <= "\u04FF")
+                and c not in '/\\:*?"<>|\n\r\t'
+            ).strip()
+        else:
+            s = "".join(c for c in name if c not in '/\\:*?"<>|\n\r\t').strip()
+        return (s or room_id)[:80]
+    except Exception:
+        return room_id
+
+
 # ---------- экспорт архива (максимальное сжатие + кэширование) ----------
 @router.callback_query(F.data.startswith("export:"))
 async def export_playlist(callback: types.CallbackQuery):
@@ -699,6 +717,8 @@ async def export_playlist(callback: types.CallbackQuery):
 
     await callback.answer("⏳ Архив формируется, подождите...", show_alert=False)
     room_id = callback.data.split(":")[1]  # type: ignore
+    room_name = await room_service.get_room_name(room_id) or room_id
+    archive_base = _safe_archive_name(room_name, room_id)
 
     EXPORT_DIR = Path("exports")
     EXPORT_CACHE_DIR = Path("exports/cache")
@@ -736,21 +756,41 @@ async def export_playlist(callback: types.CallbackQuery):
     # --- Используем кэш, если архив уже собран ---
     cached_parts = sorted(cache_dir.glob("part*.zip")) if cache_dir.exists() else []
     if cached_parts:
-        print(f"[export] Кэш-попадание: {cache_key}")
-        total_files = len(valid)
-        for i, p in enumerate(cached_parts, 1):
-            data = p.read_bytes()
-            fname = f"{room_id}_part{i}.zip" if len(cached_parts) > 1 else f"{room_id}.zip"
-            cap = "📦 Архив комнаты" if len(cached_parts) == 1 else f"📦 Часть {i}"
-            await callback.message.answer_document(  # type: ignore
-                types.BufferedInputFile(data, filename=fname),
-                caption=f"{cap} (всего {total_files} треков)"
+        # Проверяем, что все части не превышают лимит TG (50 MB)
+        oversized = [p for p in cached_parts if p.stat().st_size > TG_MAX_FILE_BYTES]
+        if oversized:
+            print(f"[export] Кэш {cache_key} содержит переразмеренные части, пересобираем")
+            try:
+                shutil.rmtree(cache_dir)
+            except OSError:
+                pass
+            cached_parts = []
+        else:
+            print(f"[export] Кэш-попадание: {cache_key}")
+            total_parts = len(cached_parts)
+            total_files = len(valid)
+            for i, p in enumerate(cached_parts, 1):
+                data = p.read_bytes()
+                tracks_in_part = len(zipfile.ZipFile(io.BytesIO(data), "r").namelist())
+                fname = f"{archive_base}_part{i}.zip" if total_parts > 1 else f"{archive_base}.zip"
+                cap = "📦 Архив комнаты" if total_parts == 1 else f"📦 Часть {i} из {total_parts}"
+                try:
+                    await callback.message.answer_document(  # type: ignore
+                        types.BufferedInputFile(data, filename=fname),
+                        caption=f"{cap} ({tracks_in_part} треков, всего {total_files})"
+                    )
+                except Exception:
+                    archive_fallback = _safe_archive_name(room_name, room_id, strip_emoji=True)
+                    fname_fallback = f"{archive_fallback}_part{i}.zip" if total_parts > 1 else f"{archive_fallback}.zip"
+                    await callback.message.answer_document(  # type: ignore
+                        types.BufferedInputFile(data, filename=fname_fallback),
+                        caption=f"{cap} ({tracks_in_part} треков, всего {total_files})"
+                    )
+            await callback.message.answer(  # type: ignore
+                f"✅ Архив из кэша\n📦 Частей: {total_parts}\n🎵 Треков: {total_files}",
+                parse_mode="HTML"
             )
-        await callback.message.answer(  # type: ignore
-            f"✅ Архив из кэша\n📦 Частей: {len(cached_parts)}\n🎵 Треков: {total_files}",
-            parse_mode="HTML"
-        )
-        return
+            return
 
     # --- Собираем архив и сохраняем в кэш ---
     EXPORT_DIR.mkdir(exist_ok=True)
@@ -778,7 +818,8 @@ async def export_playlist(callback: types.CallbackQuery):
             pass
         return
 
-    MAX_SIZE_BYTES = int(43 * 1024 * 1024)  # 43 MB
+    # Лимит Telegram 50 MB. Zip central directory + сжатие — берём запас 35 MB.
+    MAX_SIZE_BYTES = int(35 * 1024 * 1024)  # 35 MB
 
     def _new_zip():
         buf = io.BytesIO()
@@ -805,13 +846,9 @@ async def export_playlist(callback: types.CallbackQuery):
                 current_zip.close()
                 current_buf.seek(0)
                 data = current_buf.read()
-                cache_part = cache_dir / f"part{part}.zip"
-                cache_part.write_bytes(data)
-                fname = f"{room_id}_part{part}.zip"
-                await callback.message.answer_document(  # type: ignore
-                    types.BufferedInputFile(data, filename=fname),
-                    caption=f"📦 Часть {part} ({tracks_in_part} треков)"
-                )
+                if len(data) > TG_MAX_FILE_BYTES:
+                    raise ValueError(f"Часть {part} превысила лимит TG: {len(data) // (1024*1024)} МБ")
+                (cache_dir / f"part{part}.zip").write_bytes(data)
                 part += 1
                 current_buf, current_zip = _new_zip()
                 tracks_in_part = 0
@@ -820,22 +857,38 @@ async def export_playlist(callback: types.CallbackQuery):
             current_zip.close()
             current_buf.seek(0)
             data = current_buf.read()
-            cache_part = cache_dir / f"part{part}.zip"
-            cache_part.write_bytes(data)
-            fname = f"{room_id}.zip" if part == 1 else f"{room_id}_part{part}.zip"
-            cap = "📦 Архив комнаты" if part == 1 else f"📦 Часть {part}"
-            await callback.message.answer_document(  # type: ignore
-                types.BufferedInputFile(data, filename=fname),
-                caption=f"{cap} ({tracks_in_part} треков, всего {total_files})"
-            )
+            if len(data) > TG_MAX_FILE_BYTES:
+                raise ValueError(f"Часть {part} превысила лимит TG: {len(data) // (1024*1024)} МБ")
+            (cache_dir / f"part{part}.zip").write_bytes(data)
 
         try:
             shutil.rmtree(room_folder)
         except Exception as e:
             print(f"[export] Не удалось удалить временную папку: {e}")
 
+        # Отправка из кэша (единый путь — знаем total_parts)
+        cached_parts = sorted(cache_dir.glob("part*.zip"))
+        total_parts = len(cached_parts)
+        for i, p in enumerate(cached_parts, 1):
+            data = p.read_bytes()
+            tracks_in_part = len(zipfile.ZipFile(io.BytesIO(data), "r").namelist())
+            fname = f"{archive_base}_part{i}.zip" if total_parts > 1 else f"{archive_base}.zip"
+            cap = "📦 Архив комнаты" if total_parts == 1 else f"📦 Часть {i} из {total_parts}"
+            try:
+                await callback.message.answer_document(  # type: ignore
+                    types.BufferedInputFile(data, filename=fname),
+                    caption=f"{cap} ({tracks_in_part} треков, всего {total_files})"
+                )
+            except Exception:
+                archive_fallback = _safe_archive_name(room_name, room_id, strip_emoji=True)
+                fname_fallback = f"{archive_fallback}_part{i}.zip" if total_parts > 1 else f"{archive_fallback}.zip"
+                await callback.message.answer_document(  # type: ignore
+                    types.BufferedInputFile(data, filename=fname_fallback),
+                    caption=f"{cap} ({tracks_in_part} треков, всего {total_files})"
+                )
+
         await callback.message.answer(  # type: ignore
-            f"✅ Архив комнаты готов!\n📦 Частей: {part}\n🎵 Треков: {total_files}",
+            f"✅ Архив комнаты готов!\n📦 Частей: {total_parts}\n🎵 Треков: {total_files}",
             parse_mode="HTML"
         )
     except Exception as e:
@@ -850,10 +903,19 @@ async def export_playlist(callback: types.CallbackQuery):
             shutil.rmtree(room_folder)
         except Exception:
             pass
+        # Инвалидируем кэш при ошибке (часть могла превысить лимит TG)
         try:
-            await callback.answer("❌ Ошибка при создании архива.", show_alert=True)
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
         except Exception:
-            await callback.message.answer("❌ Ошибка при создании архива.")
+            pass
+        err_msg = "❌ Ошибка при создании архива."
+        if "EntityTooLarge" in str(type(e).__name__) or "Request Entity Too Large" in str(e) or "превысила лимит" in str(e):
+            err_msg = "❌ Часть архива превысила лимит (50 МБ). Кэш сброшен — нажмите «Экспорт» снова."
+        try:
+            await callback.answer(err_msg, show_alert=True)
+        except Exception:
+            await callback.message.answer(err_msg)
 
 # ---------- очистка плейлиста ----------
 @router.callback_query(F.data.startswith("clear_confirm:"))
